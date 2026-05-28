@@ -6,6 +6,8 @@ The Judge does extra work that is the point of the system: it rewrites the user'
 
 This is a toy project for experimenting with multi-agent debate protocols, not a production system.
 
+Fair warning: this is a work-in-progress. Changes get pushed to the repo whenever something interesting occurs to me, and they might break existing functionality without notice. The latest version might not even work at all. This is a playground for experimentation, not a stable library. Treat it accordingly.
+
 ## Prerequisites
 
 - Windows 10/11 with [winget](https://learn.microsoft.com/en-us/windows/package-manager/winget/) (the bundled installer is PowerShell-only; on macOS / Linux follow the *Manual install* section below).
