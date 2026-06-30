@@ -6,7 +6,9 @@ The Judge does extra work that is the point of the system: it rewrites the user'
 
 This is a toy project for experimenting with multi-agent debate protocols, not a production system.
 
-> This is the C# / .NET rewrite. It runs models locally on [Microsoft Foundry Local](https://learn.microsoft.com/azure/foundry-local/) by default and can switch to any OpenAI-compatible remote endpoint via configuration. The original Python implementation (which used Ollama) is preserved unchanged under [old-python-src/](old-python-src). The debate *algorithm* is identical; only the runtime, the model lineup, and the infrastructure changed.
+This is the C# / .NET rewrite. It runs models locally on [Microsoft Foundry Local](https://learn.microsoft.com/azure/foundry-local/) by default and can switch to any OpenAI-compatible remote endpoint via configuration. The original Python implementation (which used Ollama) is preserved unchanged under [old-python-src/](old-python-src). The debate *algorithm* is identical; only the runtime, the model lineup, and the infrastructure changed.
+
+Fair warning: this is a work-in-progress. Changes get pushed to the repo whenever something interesting occurs to me, and they might break existing functionality without notice. The latest version might not even work at all. This is a playground for experimentation, not a stable library. Treat it accordingly.
 
 ## Prerequisites
 
