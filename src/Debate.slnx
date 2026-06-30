@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="Debate.Cli/Debate.Cli.csproj" />
+  <Project Path="Debate.Core/Debate.Core.csproj" />
+  <Project Path="Debate.Models.FoundryLocal/Debate.Models.FoundryLocal.csproj" />
+  <Project Path="Debate.Models.OpenAICompatible/Debate.Models.OpenAICompatible.csproj" />
+  <Project Path="Debate.Tests/Debate.Tests.csproj" />
+</Solution>

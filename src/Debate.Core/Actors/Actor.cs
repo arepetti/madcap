@@ -1,0 +1,110 @@
+using Microsoft.Extensions.AI;
+
+namespace Debate.Core.Actors;
+
+/// <summary>
+/// Base class for an LLM-backed participant. Holds its own conversation history
+/// as a list of <see cref="ChatMessage"/> (the idiomatic Microsoft.Extensions.AI
+/// equivalent of the original AutoGen agent's model context) and talks to the
+/// model only through the provider's <see cref="IChatClient"/>.
+///
+/// Temperature is applied per call via <see cref="ChatOptions"/> rather than
+/// baked into a client, which is the idiomatic .NET pattern.
+/// </summary>
+public abstract class Actor
+{
+    protected Actor(DebateContext context)
+    {
+        Context = context;
+    }
+
+    protected DebateContext Context { get; }
+
+    public abstract DebateRole Role { get; }
+    public abstract string DisplayName { get; }
+
+    /// <summary>
+    /// The persona file token this actor loads ("&lt;preset&gt;.&lt;token&gt;.txt").
+    /// Defaults to the role token; the Judge sub-roles override it so each single-job
+    /// context has its own system prompt.
+    /// </summary>
+    public virtual string PersonaToken => Role.ToToken();
+
+    protected float Temperature => Context.Config.TemperatureFor(Role);
+
+    /// <summary>
+    /// Conversation buffer including the system message at index 0. Null until
+    /// first use so system prompts (which may embed cross-round state) are
+    /// rendered as late as possible.
+    /// </summary>
+    private List<ChatMessage>? _history;
+
+    /// <summary>
+    /// Build the system prompt. Default loads the persona file verbatim;
+    /// roles whose prompt embeds session state override this.
+    /// </summary>
+    protected virtual string RenderSystemPrompt() =>
+        Context.Personas.Load(Context.Config.PersonaName, PersonaToken);
+
+    private List<ChatMessage> History()
+    {
+        return _history ??= [new(ChatRole.System, RenderSystemPrompt())];
+    }
+
+    /// <summary>True once the conversation buffer (and system prompt) has been built.</summary>
+    public bool IsBuilt => _history is not null;
+
+    /// <summary>Current buffer contents, for token accounting. Empty if not built.</summary>
+    public IReadOnlyList<ChatMessage> Messages => _history ?? [];
+
+    /// <summary>
+    /// Render this actor's system prompt without mutating its buffer. Used by the
+    /// <c>!context</c> command to show exactly what the actor would be primed with.
+    /// </summary>
+    public string PreviewSystemPrompt() => RenderSystemPrompt();
+
+    /// <summary>
+    /// Force a rebuild (fresh system prompt + empty conversation) on next use.
+    /// Used for per-round actors whose system prompt reflects the latest history
+    /// and profile.
+    /// </summary>
+    public void Invalidate() => _history = null;
+
+    /// <summary>Wipe the conversation buffer (used on a new session).</summary>
+    public Task ResetMemoryAsync()
+    {
+        _history = null;
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Send one user-sourced message and return the stripped reply. Mutates the
+    /// conversation buffer so multi-turn memory is preserved within the actor's
+    /// lifetime.
+    /// </summary>
+    public async Task<string> SendAsync(string userText, CancellationToken cancellationToken)
+    {
+        var history = History();
+        history.Add(new ChatMessage(ChatRole.User, userText));
+
+        var options = new ChatOptions { Temperature = Temperature };
+        if (Context.Provider.MaxOutputTokens(Role) is int maxTokens and > 0)
+        {
+            options.MaxOutputTokens = maxTokens;
+        }
+
+        var response = await Context.Provider
+            .GetClient(Role)
+            .GetResponseAsync(history, options, cancellationToken)
+            .ConfigureAwait(false);
+
+        var text = (response.Text ?? string.Empty).Trim();
+
+        // Persist the reply WITHOUT any <think> reasoning. A reply that is all reasoning
+        // (a degenerate thinking loop) would otherwise stay in the buffer and be re-read
+        // on the next turn — including the automatic re-ask after a parse failure — which
+        // just feeds the loop. The caller still gets the raw text to parse.
+        history.Add(new ChatMessage(ChatRole.Assistant, JsonProtocol.StripReasoning(text)));
+        return text;
+    }
+}
