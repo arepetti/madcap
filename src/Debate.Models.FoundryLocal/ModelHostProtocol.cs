@@ -75,12 +75,33 @@ public static class ModelHostProtocol
     public static string SerializeRequest(HostRequest request) =>
         JsonSerializer.Serialize(request, Options);
 
-    public static HostRequest? DeserializeRequest(string line) =>
-        JsonSerializer.Deserialize<HostRequest>(line, Options);
+    /// <summary>
+    /// Parses a request line, returning null if it is not protocol JSON. Callers treat
+    /// null as "skip this line" — see <see cref="DeserializeResponse"/> for why.
+    /// </summary>
+    public static HostRequest? DeserializeRequest(string line) => TryDeserialize<HostRequest>(line);
 
     public static string SerializeResponse(HostResponse response) =>
         JsonSerializer.Serialize(response, Options);
 
-    public static HostResponse? DeserializeResponse(string line) =>
-        JsonSerializer.Deserialize<HostResponse>(line, Options);
+    /// <summary>
+    /// Parses a response line, returning null if it is not protocol JSON. stdout is a
+    /// shared channel: native runtime components (ONNX Runtime, CUDA) can write
+    /// diagnostics straight to the OS handle, so a non-protocol line must be skipped
+    /// rather than abort the debate in progress.
+    /// </summary>
+    public static HostResponse? DeserializeResponse(string line) => TryDeserialize<HostResponse>(line);
+
+    private static T? TryDeserialize<T>(string line)
+        where T : class
+    {
+        try
+        {
+            return JsonSerializer.Deserialize<T>(line, Options);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
 }

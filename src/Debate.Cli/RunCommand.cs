@@ -71,16 +71,40 @@ public sealed class RunCommand : AsyncCommand<RunCommand.Settings>
         ApplyCommandLineOverrides(builder, settings);
         RegisterServices(builder, settings);
 
-        using var host = builder.Build();
-
-        if (!await TryStartHostAsync(host, cancellationToken).ConfigureAwait(false))
+        var host = builder.Build();
+        try
         {
-            return 1;
-        }
+            if (!await TryStartHostAsync(host, cancellationToken).ConfigureAwait(false))
+            {
+                return 1;
+            }
 
-        return settings.Prefetch
-            ? await RunPrefetchAsync(host, cancellationToken).ConfigureAwait(false)
-            : await RunReplAsync(host, settings, cancellationToken).ConfigureAwait(false);
+            return settings.Prefetch
+                ? await RunPrefetchAsync(host, cancellationToken).ConfigureAwait(false)
+                : await RunReplAsync(host, settings, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            await DisposeHostAsync(host).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Disposes the host asynchronously when it supports it. <see cref="IHost"/> only
+    /// declares <see cref="IDisposable"/>, but the default implementation is also
+    /// <see cref="IAsyncDisposable"/> — and the synchronous path blocks the calling thread
+    /// while the Foundry Local provider tears down its child model processes.
+    /// </summary>
+    private static async ValueTask DisposeHostAsync(IHost host)
+    {
+        if (host is IAsyncDisposable asyncDisposable)
+        {
+            await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+        }
+        else
+        {
+            host.Dispose();
+        }
     }
 
     /// <summary>
@@ -184,14 +208,15 @@ public sealed class RunCommand : AsyncCommand<RunCommand.Settings>
     /// Prefetch mode: the started backend has (for Foundry Local) registered execution
     /// providers and cached models. Force every model in the active profile to load once,
     /// regardless of execution mode, then stop and exit so the first interactive run is warm.
+    /// Backends without a warm-up step simply have nothing to do here.
     /// </summary>
     private static async Task<int> RunPrefetchAsync(IHost host, CancellationToken cancellationToken)
     {
         try
         {
-            if (host.Services.GetRequiredService<IModelProvider>() is ProcessModelProvider pool)
+            if (host.Services.GetRequiredService<IModelProvider>() is IPrefetchable prefetchable)
             {
-                await pool.PrefetchAsync(cancellationToken).ConfigureAwait(false);
+                await prefetchable.PrefetchAsync(cancellationToken).ConfigureAwait(false);
             }
 
             AnsiConsole.MarkupLine("[green]Prefetch complete: execution providers and models are cached.[/]");

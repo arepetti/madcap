@@ -16,10 +16,11 @@ namespace Debate.Core;
 /// typed reply (see <see cref="JsonProtocol"/>). There are no magic strings in the
 /// model output; a reply that is not parseable triggers one automatic re-ask.
 ///
-/// The actors stay dumb. To change the process, change this class (or subclass it);
-/// the actors and the host need no edits.
+/// The actors stay dumb. To change the process, change this class or subclass it and
+/// override one of the <c>protected virtual</c> phase methods, then pass a factory to
+/// <see cref="DebateEngine"/>; the actors and the host need no edits.
 /// </summary>
-public sealed partial class DebatePipeline
+public partial class DebatePipeline
 {
     // How many times the Judge is nudged to produce a valid rephrase/clarify reply
     // before the question is aborted.
@@ -32,8 +33,8 @@ public sealed partial class DebatePipeline
     // JSON shapes echoed back to an actor when its reply could not be parsed.
     private const string RephraseShape = "{\"action\":\"rephrase\"|\"clarify\",\"text\":\"...\"}";
     private const string AnswerShape = "{\"answer\":\"...\"}";
-    private const string RestateShape = "{\"restatement\":\"...\"}";
-    private const string CritiqueShape = "{\"done\":false,\"objection\":\"...\"}";
+    private const string RestateShape = "{\"restatement\":\"...\",\"unsupported\":[\"...\"]}";
+    private const string CritiqueShape = "{\"scratch\":\"...\",\"done\":false,\"objection\":\"...\"}";
     private const string VerdictShape =
         "{\"answer\":\"...\",\"confidence\":\"low|medium|high\",\"justification\":\"...\",\"uncertainty\":\"...\"}";
     private const string ProfileShape = "{\"tendency\":\"...\"|null}";
@@ -49,10 +50,12 @@ public sealed partial class DebatePipeline
     [GeneratedRegex(@"\b(low|medium|high)\b", RegexOptions.IgnoreCase)]
     private static partial Regex ConfidenceLabelRegex();
 
-    private readonly DebateContext _context;
-    private readonly IDebateObserver _observer;
-    private readonly IClarificationSource _clarifications;
-    private readonly ITokenCounter _tokens;
+    // Protected so a subclass overriding a phase can reach the same collaborators the
+    // built-in phases use.
+    protected readonly DebateContext _context;
+    protected readonly IDebateObserver _observer;
+    protected readonly IClarificationSource _clarifications;
+    protected readonly ITokenCounter _tokens;
 
     public DebatePipeline(
         DebateContext context,
@@ -66,9 +69,9 @@ public sealed partial class DebatePipeline
         _tokens = tokens;
     }
 
-    public async Task RunAsync(string userQuestion, CancellationToken cancellationToken)
+    public virtual async Task RunAsync(string userQuestion, CancellationToken cancellationToken)
     {
-        ResetPerRound();
+        ResetPerQuestion();
 
         var stats = _context.Stats;
         stats.Questions++;
@@ -94,8 +97,7 @@ public sealed partial class DebatePipeline
             // Bookkeeping: the rephraser keeps the rephrased question and the verdict it
             // reached (the Critic still only reads PriorRephrased; the verdict is shown to
             // the rephraser alone, for follow-up continuity).
-            _context.PriorRephrased.Add(rephrased);
-            _context.PriorVerdicts.Add(outcome.Value.VerdictText);
+            _context.RecordExchange(rephrased, outcome.Value.VerdictText);
             await ExtractProfileNoteAsync(outcome.Value.Objections, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -115,7 +117,13 @@ public sealed partial class DebatePipeline
 
     // Phase 0
 
-    private void ResetPerRound()
+    /// <summary>
+    /// Rebuilds the Critic and the four Judge contexts so their system prompts pick up
+    /// the latest session state (profile, prior exchanges). This runs once per question,
+    /// not once per debate round: within a question the Critic keeps the buffer it was
+    /// given, which is what makes it memoryless across questions but coherent within one.
+    /// </summary>
+    protected virtual void ResetPerQuestion()
     {
         _context.Critic.Invalidate();
         foreach (var judge in _context.JudgeContexts())
@@ -126,7 +134,7 @@ public sealed partial class DebatePipeline
 
     // Phase 1
 
-    private async Task<string?> RephraseAsync(string userQuestion, CancellationToken cancellationToken)
+    protected virtual async Task<string?> RephraseAsync(string userQuestion, CancellationToken cancellationToken)
     {
         var judge = _context.JudgeRephraser;
 
@@ -229,13 +237,14 @@ public sealed partial class DebatePipeline
         _observer.OnWarning(
             $"judge reply chose neither 'rephrase' nor 'clarify'; nudging ({nudges}/{MaxRephraseNudges})");
         _observer.OnStatus("Re-asking the Judge to rephrase or clarify...");
-        prompt = DebatePrompts.WithNoThink(DebatePrompts.BuildRephrase(userQuestion));
+        prompt = DebatePrompts.WithNoThink(
+            DebatePrompts.BuildRephrase(userQuestion), ModelFor(DebateRole.Judge));
         return true;
     }
 
     // Phase 2
 
-    private async Task<DebateOutcome?> DebateAsync(string rephrasedQuestion, CancellationToken cancellationToken)
+    protected virtual async Task<DebateOutcome?> DebateAsync(string rephrasedQuestion, CancellationToken cancellationToken)
     {
         // The Answerer may ask the user (via the rephraser) for missing information before
         // its first turn; that exchange does not count as a round and never reaches the
@@ -261,7 +270,7 @@ public sealed partial class DebatePipeline
     /// per-round restatement/objection records (for the verdict transcript) and the raw
     /// objections (the profiler's only input).
     /// </summary>
-    private async Task<(List<RoundRecord> Rounds, List<string> Objections)> RunDebateRoundsAsync(
+    protected virtual async Task<(List<RoundRecord> Rounds, List<string> Objections)> RunDebateRoundsAsync(
         string answererReply, CancellationToken cancellationToken)
     {
         int maxRounds = _context.Config.MaxRounds;
@@ -317,7 +326,7 @@ public sealed partial class DebatePipeline
     /// facts. It is the only Judge context that ever sees the raw reply; the Critic and the
     /// verdict only ever see this restatement. Falls back to the raw answer if it fails.
     /// </summary>
-    private async Task<string> RestateAsync(
+    protected virtual async Task<string> RestateAsync(
         string answererReply, int round, int maxRounds, CancellationToken cancellationToken)
     {
         _observer.OnStatus($"Asking the Judge to restate the answer as neutral facts (round {round + 1}/{maxRounds})...");
@@ -330,12 +339,44 @@ public sealed partial class DebatePipeline
         {
             restatement = answererReply;
         }
+        else
+        {
+            restatement = AppendUnsupportedClaims(restatement, restated?.Unsupported);
+        }
 
         _observer.OnRestatement(restatement);
         return restatement;
     }
 
-    private async Task<(bool Done, string Objection)> GetObjectionAsync(
+    /// <summary>
+    /// Folds the restater's flagged-unsupported list into the text the Critic receives.
+    /// The flag is kept out of the restatement proper (so the restater is not asked to
+    /// editorialise text it was told to re-express faithfully) but still has to reach the
+    /// Critic, which is the actor that can do something with it.
+    /// </summary>
+    private static string AppendUnsupportedClaims(string restatement, IReadOnlyList<string>? unsupported)
+    {
+        var claims = unsupported?
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Select(c => c.Trim())
+            .ToList();
+
+        if (claims is null || claims.Count == 0)
+        {
+            return restatement;
+        }
+
+        var builder = new StringBuilder(restatement);
+        builder.Append("\n\nAsserted without support:");
+        foreach (var claim in claims)
+        {
+            builder.Append("\n- ").Append(claim);
+        }
+
+        return builder.ToString();
+    }
+
+    protected virtual async Task<(bool Done, string Objection)> GetObjectionAsync(
         string restatement, int round, int maxRounds, CancellationToken cancellationToken)
     {
         _observer.OnStatus($"Asking the Critic to challenge the answer (round {round + 1}/{maxRounds})...");
@@ -353,7 +394,7 @@ public sealed partial class DebatePipeline
     /// next round's restatement, so the verdict sees it as rephrased facts rather than raw
     /// text — keeping the arbiter's context "rephrased only".
     /// </summary>
-    private async Task<string> GetRebuttalAsync(
+    protected virtual async Task<string> GetRebuttalAsync(
         string objection, int round, int maxRounds, CancellationToken cancellationToken)
     {
         _observer.OnStatus($"Asking the Answerer to respond to the Critic (round {round + 1}/{maxRounds})...");
@@ -369,7 +410,7 @@ public sealed partial class DebatePipeline
     /// Critic's objections, round by round. Records the parsed confidence and surfaces the
     /// verdict, returning its text for bookkeeping.
     /// </summary>
-    private async Task<string> IssueVerdictAsync(
+    protected virtual async Task<string> IssueVerdictAsync(
         IReadOnlyList<RoundRecord> rounds, CancellationToken cancellationToken)
     {
         _observer.OnStatus("Asking the Judge to weigh the debate and issue a verdict...");
@@ -386,8 +427,12 @@ public sealed partial class DebatePipeline
         }
         else
         {
+            // Both the call and the re-ask failed to parse, so the raw reply becomes the
+            // user's answer. Strip reasoning first, as Actor.SendAsync does: otherwise a
+            // degenerate <think> loop is printed as the verdict and then stored in the
+            // rephraser's session memory for the rest of the session.
             confidence = ParseConfidence(verdictRaw);
-            verdictText = verdictRaw.Trim();
+            verdictText = JsonProtocol.StripReasoning(verdictRaw).Trim();
         }
 
         _context.Stats.RecordConfidence(confidence);
@@ -402,7 +447,7 @@ public sealed partial class DebatePipeline
     /// neutral facts and fed straight back to the Answerer. Returns the answer text, or
     /// null if the Answerer never produced a usable answer (e.g. the user skipped/aborted).
     /// </summary>
-    private async Task<string?> GetInitialAnswerAsync(string rephrasedQuestion, CancellationToken cancellationToken)
+    protected virtual async Task<string?> GetInitialAnswerAsync(string rephrasedQuestion, CancellationToken cancellationToken)
     {
         var answerer = _context.Answerer;
         var prompt = DebatePrompts.BuildAnswer(rephrasedQuestion);
@@ -450,7 +495,11 @@ public sealed partial class DebatePipeline
     {
         _observer.OnWarning("Answerer returned no answer; re-asking once.");
         var (retry, _) = await SendJsonAsync<AnswererReply>(
-            _context.Answerer, DebatePrompts.WithNoThink(DebatePrompts.BuildAnswer(rephrasedQuestion)), AnswerShape, TokenBucket.Answerer, cancellationToken)
+            _context.Answerer,
+            DebatePrompts.WithNoThink(DebatePrompts.BuildAnswer(rephrasedQuestion), ModelFor(DebateRole.Answerer)),
+            AnswerShape,
+            TokenBucket.Answerer,
+            cancellationToken)
             .ConfigureAwait(false);
         var retried = retry?.Answer?.Trim() ?? string.Empty;
         if (!string.IsNullOrWhiteSpace(retried))
@@ -539,7 +588,7 @@ public sealed partial class DebatePipeline
 
     // Phase 3
 
-    private async Task ExtractProfileNoteAsync(IReadOnlyList<string> objections, CancellationToken cancellationToken)
+    protected virtual async Task ExtractProfileNoteAsync(IReadOnlyList<string> objections, CancellationToken cancellationToken)
     {
         if (!_context.Config.BuildProfile)
         {
@@ -589,7 +638,7 @@ public sealed partial class DebatePipeline
     /// value). Token usage for every call (including the re-ask) is added to
     /// <paramref name="bucket"/>; the raw final reply is returned for fallbacks.
     /// </summary>
-    private async Task<(T? Value, string Raw)> SendJsonAsync<T>(
+    protected async Task<(T? Value, string Raw)> SendJsonAsync<T>(
         Actor actor, string prompt, string shape, TokenBucket bucket, CancellationToken cancellationToken)
         where T : class
     {
@@ -604,7 +653,7 @@ public sealed partial class DebatePipeline
             $"{actor.DisplayName} reply was not valid JSON ({error}); re-asking once. " +
             $"Full reply:\n{raw}");
 
-        var reask = DebatePrompts.BuildReask(shape);
+        var reask = DebatePrompts.BuildReask(shape, ModelFor(actor.Role));
         var raw2 = await actor.SendAsync(reask, cancellationToken).ConfigureAwait(false);
         _context.Stats.Add(bucket, CountTokens(reask, raw2));
         if (JsonProtocol.TryParse<T>(raw2, out var value2, out var error2))
@@ -669,7 +718,10 @@ public sealed partial class DebatePipeline
         _ => null,
     };
 
-    private int CountTokens(params ReadOnlySpan<string?> texts)
+    /// <summary>The model serving a role, used to tailor model-specific prompt directives.</summary>
+    protected string ModelFor(DebateRole role) => _context.Provider.ModelName(role);
+
+    protected int CountTokens(params ReadOnlySpan<string?> texts)
     {
         int total = 0;
         foreach (var t in texts)
@@ -683,7 +735,9 @@ public sealed partial class DebatePipeline
         return total;
     }
 
-    private sealed class RoundRecord
+    /// <summary>One debate round as the verdict transcript sees it: the Answerer's
+    /// position in restated form, paired with the objection raised against it.</summary>
+    protected sealed class RoundRecord
     {
         public RoundRecord(string restatement, string critique)
         {
@@ -697,5 +751,5 @@ public sealed partial class DebatePipeline
 
     /// <summary>What a completed debate hands back: the verdict text (stored for the
     /// rephraser) and the Critic's objections (the profiler's only input).</summary>
-    private readonly record struct DebateOutcome(string VerdictText, IReadOnlyList<string> Objections);
+    protected readonly record struct DebateOutcome(string VerdictText, IReadOnlyList<string> Objections);
 }

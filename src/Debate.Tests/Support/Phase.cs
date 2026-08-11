@@ -23,7 +23,7 @@ public static class Phase
     public static bool IsRespondToObjection(string p) => p.Contains("A reviewer raised the objection below");
 
     // Critic
-    public static bool IsCritique(string p) => p.Contains("Challenge its substance");
+    public static bool IsCritique(string p) => p.Contains("Weigh its substance");
 
     // Shared
     public static bool IsReask(string p) => p.Contains("was not valid JSON");

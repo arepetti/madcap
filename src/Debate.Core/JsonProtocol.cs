@@ -12,7 +12,8 @@ namespace Debate.Core;
 public sealed class JudgeRephraseReply
 {
     /// <summary><c>rephrase</c> or <c>clarify</c>.</summary>
-    public string Action { get; set; } = string.Empty;
+    [JsonConverter(typeof(FlexibleStringConverter))]
+    public string? Action { get; set; }
 
     /// <summary>The neutral rephrasing (when rephrasing) or the question to ask (when clarifying).</summary>
     [JsonConverter(typeof(FlexibleStringConverter))]
@@ -46,11 +47,28 @@ public sealed class JudgeRestatementReply
 {
     [JsonConverter(typeof(FlexibleStringConverter))]
     public string Restatement { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Claims the restater judged to be asserted without support. Kept out of
+    /// <see cref="Restatement"/> so that "re-express faithfully" and "note a gap" stay
+    /// separate instructions — asking for both in one prose field asks the model to add
+    /// its own judgement to text it was just told not to editorialise.
+    /// </summary>
+    public List<string>? Unsupported { get; set; }
 }
 
 /// <summary>A Critic turn: either an objection, or a signal that it has no further objections.</summary>
 public sealed class CriticReply
 {
+    /// <summary>
+    /// The Critic's working notes. Read and discarded by the pipeline — it exists only so
+    /// the "weigh the position, then report one objection" instruction has a place to do
+    /// the weighing. Without it, small models either skip the analysis or smuggle it into
+    /// the objection as an ad-hoc structure.
+    /// </summary>
+    [JsonConverter(typeof(FlexibleStringConverter))]
+    public string? Scratch { get; set; }
+
     /// <summary>True when the Critic has no further substantive objection (ends the round loop).</summary>
     [JsonConverter(typeof(FlexibleBoolConverter))]
     public bool Done { get; set; }
@@ -307,28 +325,17 @@ public static class JsonProtocol
 
     /// <summary>
     /// Isolates the most likely JSON object in <paramref name="raw"/>: strips any
-    /// reasoning block and markdown code fences, then returns the span from the first
-    /// <c>{</c> to the last <c>}</c> (inclusive). Returns null if there is no brace pair.
+    /// reasoning block, then returns the span from the first <c>{</c> to the last
+    /// <c>}</c> (inclusive). Returns null if there is no brace pair.
+    ///
+    /// Markdown code fences need no special handling — they contain no braces, so the
+    /// span between the outermost braces already excludes them wherever they sit. An
+    /// earlier version stripped fences by cutting to the first newline, which silently
+    /// destroyed the reply when a model put the fence and the JSON on one line.
     /// </summary>
     private static string? ExtractJsonObject(string raw)
     {
         var text = StripReasoning(raw.Trim());
-
-        // Strip a leading ```json / ``` fence and any trailing fence.
-        if (text.StartsWith("```", StringComparison.Ordinal))
-        {
-            int firstNewline = text.IndexOf('\n');
-            if (firstNewline >= 0)
-            {
-                text = text[(firstNewline + 1)..];
-            }
-
-            int closingFence = text.LastIndexOf("```", StringComparison.Ordinal);
-            if (closingFence >= 0)
-            {
-                text = text[..closingFence];
-            }
-        }
 
         int start = text.IndexOf('{');
         int end = text.LastIndexOf('}');

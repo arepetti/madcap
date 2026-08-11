@@ -15,16 +15,23 @@ public sealed class DebateEngine
     private readonly DebatePipeline _pipeline;
     private readonly ITokenCounter _tokens;
 
+    /// <param name="pipelineFactory">
+    /// Optional hook for supplying a <see cref="DebatePipeline"/> subclass that overrides
+    /// one or more phases. Defaults to the standard pipeline.
+    /// </param>
     public DebateEngine(
         SessionConfig config,
         IModelProvider provider,
         PersonaLibrary personas,
         ITokenCounter tokens,
         IDebateObserver observer,
-        IClarificationSource clarifications)
+        IClarificationSource clarifications,
+        Func<DebateContext, IDebateObserver, IClarificationSource, ITokenCounter, DebatePipeline>? pipelineFactory = null)
     {
         _context = new DebateContext(config, provider, personas);
-        _pipeline = new DebatePipeline(_context, observer, clarifications, tokens);
+        _pipeline = pipelineFactory is null
+            ? new DebatePipeline(_context, observer, clarifications, tokens)
+            : pipelineFactory(_context, observer, clarifications, tokens);
         _tokens = tokens;
     }
 

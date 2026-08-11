@@ -55,18 +55,63 @@ public class DebatePromptsTests
     }
 
     [Fact]
-    public void Reask_template_disables_thinking()
+    public void Reask_disables_thinking_on_a_model_that_understands_the_switch()
     {
-        var p = DebatePrompts.BuildReask("{\"answer\":\"...\"}");
+        var p = DebatePrompts.BuildReask("{\"answer\":\"...\"}", "qwen3-4b");
         Assert.Contains(DebatePrompts.NoThinkDirective, p);
         Assert.Contains("{\"answer\":\"...\"}", p);
     }
 
     [Fact]
-    public void WithNoThink_appends_directive()
+    public void Reask_omits_the_switch_on_other_model_families()
     {
-        var p = DebatePrompts.WithNoThink("hello");
-        Assert.StartsWith("hello", p);
-        Assert.EndsWith(DebatePrompts.NoThinkDirective, p);
+        var p = DebatePrompts.BuildReask("{\"answer\":\"...\"}", "gpt-4o");
+        Assert.DoesNotContain(DebatePrompts.NoThinkDirective, p);
+        Assert.Contains("{\"answer\":\"...\"}", p);
+    }
+
+    [Theory]
+    [InlineData("qwen3-4b", true)]
+    [InlineData("qwen3-8b", true)]
+    [InlineData("Qwen2.5-7B-Instruct", true)]
+    [InlineData("gpt-4o", false)]
+    [InlineData("phi-4-mini", false)]
+    [InlineData("ministral-3-3b-instruct-2512", false)]
+    [InlineData(null, false)]
+    public void The_switch_is_recognised_per_model_family(string? model, bool expected) =>
+        Assert.Equal(expected, DebatePrompts.SupportsNoThink(model));
+
+    [Fact]
+    public void WithNoThink_appends_the_directive_only_where_it_is_understood()
+    {
+        Assert.EndsWith(DebatePrompts.NoThinkDirective, DebatePrompts.WithNoThink("hello", "qwen3-4b"));
+        Assert.Equal("hello", DebatePrompts.WithNoThink("hello", "gpt-4o"));
+    }
+
+    [Fact]
+    public void ApplyNoThink_substitutes_or_removes_the_persona_placeholder()
+    {
+        const string persona = "be terse.\n{no_think}";
+
+        Assert.Equal("be terse.\n/no_think", DebatePrompts.ApplyNoThink(persona, "qwen3-4b"));
+        Assert.Equal("be terse.", DebatePrompts.ApplyNoThink(persona, "phi-4"));
+    }
+
+    [Fact]
+    public void No_persona_file_hardcodes_the_directive()
+    {
+        // The switch is Qwen3-specific, so it must come from ApplyNoThink and not from
+        // text shared by every backend.
+        var personaDirectory = Path.Combine(AppContext.BaseDirectory, "personas");
+        var files = Directory.GetFiles(personaDirectory, "*.txt");
+        Assert.NotEmpty(files);
+
+        foreach (var file in files)
+        {
+            var text = File.ReadAllText(file);
+            Assert.DoesNotContain(
+                DebatePrompts.NoThinkDirective,
+                text.Replace(DebatePrompts.NoThinkPlaceholder, string.Empty));
+        }
     }
 }

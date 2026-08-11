@@ -10,16 +10,6 @@ using Microsoft.Extensions.Options;
 namespace Debate.Models.FoundryLocal;
 
 /// <summary>
-/// A resident model host child process, for display: its OS process id, the model
-/// alias it loaded, the debate role(s) routed to it, and whether it is still alive.
-/// </summary>
-public sealed record ChildProcessInfo(
-    int Pid,
-    string Alias,
-    IReadOnlyList<DebateRole> Roles,
-    bool Running);
-
-/// <summary>
 /// A Foundry Local backend where each role's model runs in its own child process of
 /// the same executable (re-invoked with <see cref="FoundryModelHost.ModeArgument"/>),
 /// communicating over a line-delimited JSON protocol on stdin/stdout.
@@ -37,8 +27,24 @@ public sealed record ChildProcessInfo(
 /// </list>
 /// The debate algorithm only ever sees <see cref="IModelProvider"/>.
 /// </summary>
-public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisposable
+public sealed class ProcessModelProvider :
+    IModelProvider, IBackendDiagnostics, IPrefetchable, IHostedService, IDisposable, IAsyncDisposable
 {
+    /// <summary>
+    /// How long <see cref="TryDescribeProcesses"/> waits for the lifecycle lock before
+    /// reporting "busy". Short by design: it serves a display, not the debate.
+    /// </summary>
+    private static readonly TimeSpan DescribeLockTimeout = TimeSpan.FromMilliseconds(250);
+
+
+    /// <summary>
+    /// How long shutdown waits for the lifecycle lock before tearing the child processes
+    /// down anyway. In Sequential/SemiSequential mode that lock is held for the whole
+    /// duration of a model call, so waiting for it unconditionally would hang shutdown
+    /// behind an in-flight inference.
+    /// </summary>
+    private static readonly TimeSpan ShutdownLockTimeout = TimeSpan.FromSeconds(5);
+
     private readonly FoundryLocalOptions _options;
     private readonly IDebateObserver _observer;
     private readonly ILogger<ProcessModelProvider> _logger;
@@ -182,7 +188,7 @@ public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisp
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         await CancelWarmupAsync().ConfigureAwait(false);
-        await ShutdownAllAsync().ConfigureAwait(false);
+        await ShutdownAllAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task CancelWarmupAsync()
@@ -205,7 +211,14 @@ public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisp
         }
     }
 
-    public void Dispose()
+    /// <summary>
+    /// Synchronous disposal is retained for the DI container, which may call it on a
+    /// container that was not disposed asynchronously. Prefer <see cref="DisposeAsync"/>:
+    /// this path blocks the calling thread on the shutdown sequence.
+    /// </summary>
+    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    public async ValueTask DisposeAsync()
     {
         if (_disposed)
         {
@@ -215,8 +228,8 @@ public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisp
         _disposed = true;
         try
         {
-            CancelWarmupAsync().GetAwaiter().GetResult();
-            ShutdownAllAsync().GetAwaiter().GetResult();
+            await CancelWarmupAsync().ConfigureAwait(false);
+            await ShutdownAllAsync(CancellationToken.None).ConfigureAwait(false);
         }
         finally
         {
@@ -363,9 +376,16 @@ public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisp
         }
     }
 
-    private async Task ShutdownAllAsync()
+    /// <summary>
+    /// Terminates every model host process. The lifecycle lock is only *attempted*: in
+    /// Sequential/SemiSequential mode it is held for the whole duration of a model call,
+    /// and shutdown must not be hostage to an inference that may run for minutes. On
+    /// timeout the children are torn down anyway — killing them is precisely what an
+    /// abandoned request needs, and each child also exits on its own when stdin closes.
+    /// </summary>
+    private async Task ShutdownAllAsync(CancellationToken cancellationToken)
     {
-        await _lifecycleLock.WaitAsync().ConfigureAwait(false);
+        var acquired = await TryAcquireLifecycleLockAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             foreach (var process in _processes.Values)
@@ -377,8 +397,32 @@ public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisp
         }
         finally
         {
-            _lifecycleLock.Release();
+            if (acquired)
+            {
+                _lifecycleLock.Release();
+            }
         }
+    }
+
+    private async Task<bool> TryAcquireLifecycleLockAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (await _lifecycleLock.WaitAsync(ShutdownLockTimeout, cancellationToken).ConfigureAwait(false))
+            {
+                return true;
+            }
+
+            _logger.LogDebug(
+                "Shutting down model hosts without the lifecycle lock: still held after {Timeout}.",
+                ShutdownLockTimeout);
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown was itself cancelled (host shutdown timeout): tear down regardless.
+        }
+
+        return false;
     }
 
     // ----- argument / configuration plumbing -----
@@ -488,16 +532,23 @@ public sealed class ProcessModelProvider : IModelProvider, IHostedService, IDisp
         .ToList();
 
     /// <summary>
-    /// A snapshot of the model host child processes that are currently resident
-    /// (which depends on the execution mode and what has run so far), for display.
+    /// A snapshot of the model host child processes that are currently resident (which
+    /// depends on the execution mode and what has run so far). Returns null rather than
+    /// waiting out the lifecycle lock, which a model load or a Sequential-mode inference
+    /// can hold for minutes — the REPL invites the user to type while models load, so
+    /// this must not be able to freeze the prompt.
     /// </summary>
-    public IReadOnlyList<ChildProcessInfo> GetChildProcesses()
+    public IReadOnlyList<BackendProcessInfo>? TryDescribeProcesses()
     {
-        _lifecycleLock.Wait();
+        if (!_lifecycleLock.Wait(DescribeLockTimeout))
+        {
+            return null;
+        }
+
         try
         {
             return _processes
-                .Select(kvp => new ChildProcessInfo(
+                .Select(kvp => new BackendProcessInfo(
                     kvp.Value.ProcessId,
                     kvp.Key,
                     RolesFor(kvp.Key),
@@ -790,19 +841,22 @@ internal sealed class ManagedModelProcess : IAsyncDisposable
     /// </summary>
     private async Task ShutDownGracefullyAsync()
     {
+        // One budget for the whole attempt. The write matters as much as the wait: a child
+        // wedged mid-inference stops reading stdin, so an unbounded WriteLineAsync blocks
+        // forever once the pipe buffer fills — no exception is ever thrown to escape it.
+        using var cts = new CancellationTokenSource(GracefulShutdownTimeout);
         try
         {
             var shutdown = ModelHostProtocol.SerializeRequest(new HostRequest { Shutdown = true });
-            await _process.StandardInput.WriteLineAsync(shutdown).ConfigureAwait(false);
-            await _process.StandardInput.FlushAsync().ConfigureAwait(false);
+            await _process.StandardInput.WriteLineAsync(shutdown.AsMemory(), cts.Token).ConfigureAwait(false);
+            await _process.StandardInput.FlushAsync(cts.Token).ConfigureAwait(false);
             _process.StandardInput.Close();
         }
         catch
         {
-            // Pipe may already be gone; fall through to wait/kill.
+            // Pipe may already be gone, or the child stopped reading; fall through to wait/kill.
         }
 
-        using var cts = new CancellationTokenSource(GracefulShutdownTimeout);
         try
         {
             await _process.WaitForExitAsync(cts.Token).ConfigureAwait(false);

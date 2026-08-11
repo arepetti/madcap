@@ -67,20 +67,30 @@ public static class DebatePrompts
         "Restate the Answerer reply below as neutral, fact-only claims. Strip rhetoric, " +
         "hedging, and persuasive framing; preserve every factual claim, figure, named " +
         "concept, and conditional. Do not add opinion, do not correct, do not contradict, " +
-        "do not introduce new information. If a claim is unsupported, say so factually.\n" +
-        "Reply with JSON only: {\"restatement\":\"...\"}\n\n" +
+        "do not introduce new information.\n" +
+        "Keep these two jobs separate. \"restatement\" is the neutral re-expression and " +
+        "nothing else. If the reply asserts something without offering support for it, " +
+        "quote that claim in \"unsupported\" — that is where noting a gap belongs, so the " +
+        "restatement itself stays free of your judgement. Use an empty list when every " +
+        "claim is supported.\n" +
+        "Reply with JSON only: {\"restatement\":\"...\",\"unsupported\":[\"<claim>\", ...]}\n\n" +
         "ANSWERER REPLY:\n{answer}";
 
     public const string CritiqueTemplate =
-        "Below is the Answerer's position as a neutral restatement. Weigh its substance " +
-        "PRIVATELY — unsupported claims, hidden assumptions, edge cases, the strongest " +
-        "opposing view — then report ONLY your single strongest objection.\n" +
+        "Below is the Answerer's position as a neutral restatement. Weigh its substance — " +
+        "unsupported claims, hidden assumptions, edge cases, the strongest opposing view — " +
+        "then report your single strongest objection.\n" +
+        "Do that weighing in the \"scratch\" field: a few short lines, discarded after you " +
+        "reply and never shown to anyone. It exists so the analysis has somewhere to go " +
+        "other than the objection itself.\n" +
         "Reply with a JSON object containing EXACTLY these keys and no others: " +
-        "{\"done\":false,\"objection\":\"<your single strongest objection as ONE plain-text string>\"} " +
-        "— or {\"done\":true} if you have no substantive objection left.\n" +
+        "{\"scratch\":\"<your brief weighing, discarded>\"," +
+        "\"done\":false," +
+        "\"objection\":\"<your single strongest objection as ONE plain-text string>\"} " +
+        "— or {\"scratch\":\"...\",\"done\":true} if you have no substantive objection left.\n" +
         "Do NOT add any other keys (no \"unsupported_claims\", \"hidden_assumptions\", " +
-        "\"edge_cases\", \"strongest_opposing_view\", or the like): that analysis is your " +
-        "private thinking, not output. \"objection\" is ONE string of one or two sentences — " +
+        "\"edge_cases\", \"strongest_opposing_view\", or the like) — that analysis goes in " +
+        "\"scratch\", as prose. \"objection\" is ONE string of one or two sentences — " +
         "never a list, nested object, or bullet points.\n\n" +
         "POSITION:\n{restatement}";
 
@@ -107,17 +117,35 @@ public static class DebatePrompts
         "CRITIC OBJECTIONS:\n{objections}";
 
     /// <summary>
-    /// Qwen3 soft switch that disables chain-of-thought. Appended to retry/nudge prompts
-    /// (a stray "thinking" loop is the usual reason a reply needed re-asking in the first
-    /// place); harmless to other model families, which treat it as plain text.
+    /// Qwen3 soft switch that disables chain-of-thought. Applied to retry/nudge prompts and
+    /// to the persona files' <c>{no_think}</c> placeholder — a stray "thinking" loop is the
+    /// usual reason a reply needed re-asking in the first place.
+    ///
+    /// Only emitted for models that implement it (see <see cref="SupportsNoThink"/>).
+    /// Elsewhere it is not merely inert: an unexplained command-looking token invites a
+    /// capable model to acknowledge or query it, which is exactly the non-JSON preamble
+    /// the directive exists to prevent.
     /// </summary>
     public const string NoThinkDirective = "/no_think";
+
+    /// <summary>
+    /// Whether <paramref name="modelName"/> understands <see cref="NoThinkDirective"/>.
+    /// Matched on the name because that is all <see cref="IModelProvider"/> exposes, and it
+    /// is what both backends key their own model selection on.
+    /// </summary>
+    public static bool SupportsNoThink(string? modelName) =>
+        modelName is not null && modelName.Contains("qwen", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Appended when a reply could not be parsed, to coax a clean retry.</summary>
     public const string ReaskTemplate =
         "Your previous reply was not valid JSON. Reply with ONLY a single JSON object of " +
-        "this exact shape and nothing else (no prose, no markdown, no code fences):\n{shape}\n\n" +
-        NoThinkDirective;
+        "this exact shape and nothing else (no prose, no markdown, no code fences):\n{shape}";
+
+    /// <summary>
+    /// The placeholder persona files carry in place of a hardcoded directive, so the
+    /// switch is applied per model rather than baked into text shared by every backend.
+    /// </summary>
+    public const string NoThinkPlaceholder = "{no_think}";
 
     public static string BuildRephrase(string question) => RephraseTemplate.Replace("{question}", question);
 
@@ -149,8 +177,25 @@ public static class DebatePrompts
                 ? "(none)"
                 : string.Join("\n", objections.Select((o, i) => $"{i + 1}. {o}")));
 
-    public static string BuildReask(string shape) => ReaskTemplate.Replace("{shape}", shape);
+    public static string BuildReask(string shape, string? modelName) =>
+        WithNoThink(ReaskTemplate.Replace("{shape}", shape), modelName);
 
-    /// <summary>Appends the <see cref="NoThinkDirective"/> to a prompt, for nudge/repeat turns.</summary>
-    public static string WithNoThink(string prompt) => $"{prompt}\n\n{NoThinkDirective}";
+    /// <summary>
+    /// Appends the <see cref="NoThinkDirective"/> to a prompt for nudge/repeat turns, if
+    /// <paramref name="modelName"/> is a family that implements it. Otherwise returns the
+    /// prompt unchanged.
+    /// </summary>
+    public static string WithNoThink(string prompt, string? modelName) =>
+        SupportsNoThink(modelName) ? $"{prompt}\n\n{NoThinkDirective}" : prompt;
+
+    /// <summary>
+    /// Substitutes the <see cref="NoThinkPlaceholder"/> in a rendered persona file with the
+    /// directive, or removes it (and the blank line it sat on) for models without it.
+    /// </summary>
+    public static string ApplyNoThink(string personaText, string? modelName) =>
+        SupportsNoThink(modelName)
+            ? personaText.Replace(NoThinkPlaceholder, NoThinkDirective)
+            : personaText.Replace($"\n{NoThinkPlaceholder}", string.Empty)
+                .Replace(NoThinkPlaceholder, string.Empty)
+                .TrimEnd();
 }

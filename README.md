@@ -16,7 +16,7 @@ Fair warning: this is a work-in-progress. Changes get pushed to the repo wheneve
 - [Foundry Local](https://learn.microsoft.com/azure/foundry-local/get-started) for the default local backend:
   - Windows: `winget install Microsoft.FoundryLocal`
   - macOS: `brew install foundrylocal`
-- Several GB of free disk and RAM **per model**. The default `small` profile uses three ~2–4 GB models (`phi-4-mini`, `ministral-3-3b-instruct-2512`, `qwen3-4b`); the `normal` profile uses larger ones (`phi-4`, `mistral-7b-v0.2`, `qwen3-8b`, roughly 5–8 GB each). They download on first run.
+- Several GB of free disk and RAM **per model**. The default `small` profile pairs a full-size `phi-4` Answerer with a ~3 GB Critic and Judge; `smaller` keeps all three around 2–4 GB for modest hardware; `normal` uses the larger models throughout (roughly 5–8 GB each). They download on first run.
 
 The remote backend needs no local models, just an endpoint and an API key (see [Switching to a remote backend](#switching-to-a-remote-backend)).
 
@@ -61,7 +61,7 @@ Anything that does not start with `!` is treated as a question for the debate.
 | Option            | Effect                                                                 |
 | ----------------- | ---------------------------------------------------------------------- |
 | `--provider`      | `FoundryLocal` (default) or `Remote`. Overrides config.                |
-| `--profile`       | Foundry Local model profile, e.g. `small` (default) or `normal`. Overrides config. |
+| `--profile`       | Foundry Local model profile: `smaller`, `small` (default), or `normal`. Overrides config. |
 | `--execution-provider` | Force a provider: `auto` (default), `cpu`, `cuda`, `webgpu`. Use `cpu` to avoid GPU out-of-memory. |
 | `--execution-mode` | Model residency for the active profile: `parallel` (all loaded, fast), `sequential` (one at a time, lowest memory), or `semisequential` (Judge stays resident, others cycle). |
 | `--no-window`     | Launch per-model host processes with no console window (default: with a window). |
@@ -88,15 +88,19 @@ All settings live in [src/Debate.Cli/appsettings.json](src/Debate.Cli/appsetting
       "SeparateWindows": true,            // per-model host processes get a console window (false = --no-window)
       "Profile": "small",                 // active model profile (override with --profile)
       "Profiles": {
-        "normal": { "Answerer": "phi-4",      "Critic": "mistral-7b-v0.2",             "Judge": "qwen3-8b", "ExecutionProvider": "cuda", "ExecutionMode": "Parallel" },
-        "small":  { "Answerer": "phi-4-mini", "Critic": "ministral-3-3b-instruct-2512", "Judge": "qwen3-4b", "ExecutionProvider": "cuda", "ExecutionMode": "SemiSequential" }
+        "normal":  { "Answerer": "phi-4",      "Critic": "mistral-7b-v0.2",              "Judge": "qwen3-8b", "ExecutionProvider": "cuda", "ExecutionMode": "Parallel" },
+        "small":   { "Answerer": "phi-4",      "Critic": "ministral-3-3b-instruct-2512", "Judge": "qwen3-4b", "ExecutionProvider": "cuda", "ExecutionMode": "SemiSequential" },
+        "smaller": { "Answerer": "phi-4-mini", "Critic": "ministral-3-3b-instruct-2512", "Judge": "qwen3-4b", "ExecutionProvider": "cuda", "ExecutionMode": "SemiSequential" }
       }
     },
     "Remote": {
       "Endpoint": "https://api.openai.com/v1",
       "ApiKeyEnvVar": "DEBATE_API_KEY",
       "ContextSize": 128000,
-      "Models": { "Answerer": "gpt-4o-mini", "Critic": "gpt-4o-mini", "Judge": "gpt-4o" }
+      // Distinct models per role, per the design invariant below. Same-vendor models
+      // only partially satisfy it: they are still more familiar to each other than a
+      // Mistral or Qwen model would be.
+      "Models": { "Answerer": "gpt-4o-mini", "Critic": "gpt-4.1-mini", "Judge": "gpt-4o" }
     }
   }
 }
@@ -106,13 +110,13 @@ All settings live in [src/Debate.Cli/appsettings.json](src/Debate.Cli/appsetting
 
 Models are organized into named **profiles** — each a complete role lineup — so you can trade quality for resource use without editing individual aliases. Pick one with `--profile <name>` or the `Profile` config key (default `small`). Every profile uses **three distinct model families**, which satisfies both design invariants at once (see [design.md](design.md)): the Critic differs from the Answerer to avoid an echo chamber, and the Judge differs from the Answerer to avoid self-preference bias when it restates and judges.
 
-| Role     | `small` (default)               | `normal`            | Why                                                                 |
-| -------- | ------------------------------- | ------------------- | ------------------------------------------------------------------- |
-| Answerer | `phi-4-mini`                    | `phi-4`             | Drafts the substantive answer (Phi family).                          |
-| Judge    | `qwen3-4b`                      | `qwen3-8b`          | Strong instruction-following for the single-task JSON prompts (rephrase/clarify, restate, verdict) (Qwen family). |
-| Critic   | `ministral-3-3b-instruct-2512`  | `mistral-7b-v0.2`   | A third family, run hot for diverse objections (Mistral family).     |
+| Role     | `smaller`                       | `small` (default)               | `normal`            | Why                                                                 |
+| -------- | ------------------------------- | ------------------------------- | ------------------- | ------------------------------------------------------------------- |
+| Answerer | `phi-4-mini`                    | `phi-4`                         | `phi-4`             | Drafts the substantive answer (Phi family).                          |
+| Judge    | `qwen3-4b`                      | `qwen3-4b`                      | `qwen3-8b`          | Strong instruction-following for the single-task JSON prompts (rephrase/clarify, restate, verdict) (Qwen family). |
+| Critic   | `ministral-3-3b-instruct-2512`  | `ministral-3-3b-instruct-2512`  | `mistral-7b-v0.2`   | A third family, run hot for diverse objections (Mistral family).     |
 
-The `small` profile keeps every model around 2–4 GB for modest hardware; `normal` uses the larger, higher-quality models. Each profile binds its lineup to a device and a residency strategy:
+`smaller` keeps every model around 2–4 GB for modest hardware. `small` (the default) spends the extra memory where it matters most — a full-size `phi-4` Answerer drafting the answer — while keeping the Critic and Judge small. `normal` scales all three up. Each profile binds its lineup to a device and a residency strategy:
 
 - `ExecutionProvider` — `auto`, `cpu`, `cuda`, or `webgpu`. Both default profiles use **`cuda`**. The top-level `ExecutionProvider` (and `--execution-provider`) overrides the profile when set to a concrete value; `auto` defers to the profile.
 - `ExecutionMode` — how per-model processes are kept resident:

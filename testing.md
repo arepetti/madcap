@@ -20,21 +20,23 @@ From Wynn, A., Satija, H., & Hadfield, G. (2025). *Talk Isn't Always Cheap: Unde
 
 # Reading `!stats` for evaluation
 
+To be clear about what exists: this file describes a protocol to follow by hand. There is no evaluation harness in this repository — no dataset loader, no scorer, no batch runner — and none of the comparisons below have been run. `!stats` measures cost and context usage only; nothing it reports correlates with whether a verdict was correct. Treat every claim in [design.md](design.md) about the debate improving answers as an untested hypothesis until this protocol is actually executed.
+
 The datasets above are the *what* of evaluation and the prompts are the *how you ask*. `!stats` is the *what it cost*. Used together with an external output-quality check (did the verdict actually match the dataset's ground-truth answer?), these numbers are what tells you whether this multi-agent debate (DAB, "debate among agents baseline") is doing better, worse, or just *differently* than simpler baselines (a single-shot CoT floor and a Self-Refine style self-critique loop in the spirit of Madaan et al., 2023), and whether one DAB configuration is worth more than another. The session counters reset on `!new`.
 
 ## What the numbers mean
 
 `!stats` prints session totals in the order below. Read them in pairs (counters, then wall time, then tokens).
 
-- **Questions / Clarifications.** *Questions* counts user prompts that reached the pipeline. *Clarifications* counts `CLARIFY:` requests the Judge made before producing a `REPHRASED:` form. A high clarification-to-question ratio means the persona is leaving too much room for the Judge to push back. Useful when comparing presets, less useful for raw cost.
-- **Debate rounds (total).** Cumulative debate iterations across the session, capped per question by `MAX_DEBATE_ROUNDS` in [src/debate_pkg/pipeline.py](src/debate_pkg/pipeline.py). Always hitting the cap means the Critic never says "no further objections" (push back on Critic temperature or persona). Always exactly one means the Critic is giving up immediately (the opposite problem).
+- **Questions / Clarifications.** *Questions* counts user prompts that reached the pipeline. *Clarifications* counts the times the Judge rephraser replied `{"action":"clarify"}` instead of `{"action":"rephrase"}`, plus the times the Answerer asked the user for missing information before its first turn. A high clarification-to-question ratio means the persona is leaving too much room for the Judge to push back. Useful when comparing presets, less useful for raw cost.
+- **Debate rounds (total).** Cumulative debate iterations across the session, capped per question by `SessionConfig.MaxRounds` (set from `Debate:Defaults:MaxRounds` in [src/Debate.Cli/appsettings.json](src/Debate.Cli/appsettings.json), the setup wizard, or `--rounds`). Always hitting the cap means the Critic never says "no further objections" (push back on Critic temperature or persona). Always exactly one means the Critic is giving up immediately (the opposite problem).
 - **Wall time, `question -> answer` (total and last).** Includes Phase 1 clarification round-trips. This is the *user-experienced* latency.
 - **Wall time, `rephrased -> answer` (total and last).** Strips out the clarification dialogue. This is the *debate-only* latency, and is the right number to compare against a single-shot or Self-Refine baseline that has no clarification step.
 - **Tokens, `total`.** Headline cost number. Sum of the five buckets below.
 - **Tokens, `rephrase question`.** All Phase 1 traffic (initial question, Judge replies, nudges, user clarifications). Self-Refine has no equivalent. A large value usually means clarification rather than the rephrase itself.
 - **Tokens, `answerer turns`.** Every `Answerer.send` call in Phase 2 (the rephrased question, every critique fed back in, every Answerer reply). Closest counterpart to a Self-Refine "generate" call summed across revisions.
 - **Tokens, `critic (restate + critic)`.** Judge restatements plus Critic critiques. The restate cost is the price of the channel constraint described in [design.md](design.md) ("Restatement as an extractive paraphrase"). The Critic cost is the equivalent of Self-Refine's "critique" call.
-- **Tokens, `judge verdict`.** Single call per question. Roughly constant; if it grows over a session, the verdict prompt is being padded by something upstream (typically a growing `prior_rephrased` history).
+- **Tokens, `judge verdict`.** Single call per question. It scales with the number of debate rounds — the transcript handed to the arbiter carries one restatement/objection pair per round — but not with session length: the arbiter's system prompt is the persona file alone, with no session history rendered into it. So a verdict cost that climbs across a session means rounds are climbing, not that context is leaking in.
 - **Tokens, `profile (phase 3 + render)`.** The Judge's Phase 3 extraction call plus the rendered profile snippet propagated into the Critic's system prompt each round. Collapses to zero when profile-building is off; that on/off flag is visible in `!stats` immediately above this table.
 
 ## Comparing DAB against baselines
@@ -63,11 +65,12 @@ DAB's `rephrase` and `profile` token buckets have no equivalent in Self-Refine o
 
 Hold the prompt set fixed, vary one knob at a time, re-run. What to watch in `!stats`:
 
-- **Persona preset** ([src/personas/](src/personas)). Moves `clarifications`, `debate rounds`, `tokens critic`.
-- **Per-role temperatures** ([src/debate_pkg/setup.py](src/debate_pkg/setup.py), `*_TEMP_DEFAULT`). Critic temperature drives `debate rounds` and `tokens critic`; Answerer temperature drives `tokens answerer`; Judge temperature is mostly invisible until it starts hurting `rephrase` or `verdict`.
-- **Models** (`MODELS` in [src/debate_pkg/providers/ollama.py](src/debate_pkg/providers/ollama.py), or a new provider, see [architecture.md](architecture.md)). Moves `tokens total` and both wall-time numbers. Accuracy is the orthogonal axis.
+- **Persona preset** ([src/personas/](src/personas), or `--persona`). Moves `clarifications`, `debate rounds`, `tokens critic`. Note that `default` and `technical` differ in the *content* of each role's brief but share the same structure and the same JSON output rules, so this is a lighter knob than model choice or temperature.
+- **Per-role temperatures** (`Debate:Defaults:{Answerer,Critic,Judge}Temp` in [src/Debate.Cli/appsettings.json](src/Debate.Cli/appsettings.json), or the setup wizard). Critic temperature drives `debate rounds` and `tokens critic`; Answerer temperature drives `tokens answerer`; Judge temperature is mostly invisible until it starts hurting `rephrase` or `verdict`.
+- **Models.** For the local backend, switch the whole lineup with `--profile <name>` (`normal`, `small`, `smaller`) or edit `Debate:FoundryLocal:Profiles` directly; for the remote backend, edit `Debate:Remote:Models`. Moves `tokens total` and both wall-time numbers. Accuracy is the orthogonal axis.
+- **Execution mode** (`--execution-mode`, or the profile's `ExecutionMode`). Pure latency/memory knob: `Sequential` reloads models as roles change, which inflates wall time without touching token counts. Hold it fixed when comparing anything else.
 - **Profile building on/off** (flag shown above the stats table). `tokens profile` collapses to zero. Compare accuracy with and without to validate the profile is doing useful work.
-- `**MAX_DEBATE_ROUNDS*`* in [src/debate_pkg/pipeline.py](src/debate_pkg/pipeline.py). Directly bounds `debate rounds` and indirectly bounds `tokens critic` and `tokens answerer`.
+- **Round cap** (`--rounds`, or `Debate:Defaults:MaxRounds`). Directly bounds `debate rounds` and indirectly bounds `tokens critic` and `tokens answerer`.
 
 ## Exporting `!stats` to CSV
 
@@ -75,14 +78,15 @@ Use `!stats export <path>` to append the current session's totals to a CSV file,
 
 The file is append-only. The header row is written once, when the file is first created; later exports add a single data row. Columns, in order: `role, questions, clarifications, debate_rounds, wall_time_total, last_wall_time_total, wall_time_post_rephrase, last_wall_time_post_rephrase, tokens_total, tokens_rephrase, tokens_answerer, tokens_critic, tokens_verdict, tokens_profile, verdict_confidence_low, verdict_confidence_medium, verdict_confidence_high`. The three `verdict_confidence_*` counters are session totals of how many verdicts came back at each label; together with an external correctness column they let you check whether `high` actually means anything across a session (the calibration question raised under *Calibrated confidence* in [design.md](design.md)).
 
-Typical workflow for a comparison run: pick a fixed CSV path, run the prompts from `# Prompts` under one configuration, `!stats export` with a descriptive role label, then `!new` and switch knobs (persona, temperatures, models, `MAX_DEBATE_ROUNDS`, profile on/off) for the next row.
+Typical workflow for a comparison run: pick a fixed CSV path, run the prompts from `# Prompts` under one configuration, `!stats export` with a descriptive role label, then `!new` and switch knobs (persona, temperatures, models, round cap, profile on/off) for the next row.
 
 ## Caveats
 
-- Token counts come from the local `tiktoken` heuristic ([src/debate_pkg/tokens.py](src/debate_pkg/tokens.py)). They count the request payload plus the assistant reply for each call. They do **not** include the system-prompt and conversation-history overhead the LLM also processes on every turn. The `!stats` per-actor table covers that separately as "context fill" if you need it.
+- Token counts come from a local cl100k_base tokenizer ([src/Debate.Core/TiktokenCounter.cs](src/Debate.Core/TiktokenCounter.cs), via `Microsoft.ML.Tokenizers`, with a character-ratio fallback if the encoder is unavailable). That is OpenAI's tokenizer, so for Phi/Mistral/Qwen models the counts are a consistent proxy rather than the exact tokens those models see. They count the request payload plus the assistant reply for each call, and do **not** include the system-prompt and conversation-history overhead the model also processes on every turn. The `!stats` per-actor table covers that separately as "context fill" if you need it.
 - Wall times are local clock time. Network latency to a hosted API, queue time inside the model, and terminal-rendering time are all included. Compare runs only within the same environment.
 - A single question's numbers are noisy. The 50-prompt / 3-seed floor in the protocol above is the minimum honest sample size for the cost-per-correct-answer metric, and even at that `n` a paired prompt-level comparison is preferred over independent-sample means.
 - MMLU has known label noise of roughly 5–10 % in some subjects. At small `n` this is indistinguishable from a real configuration-level effect, so do not read a 2–3 pp accuracy delta on MMLU as significant.
-- The default Ollama backend runs 7–8B models, which is materially smaller than the GPT-4-class debaters and judges used in the MAD literature cited in [design.md](design.md) (see *Default models are smaller than the literature assumes* in *Known issues*). Numbers from this CLI on the defaults are useful for *within-configuration* comparisons but should not be quoted against external MAD-vs-baseline results without re-validating on a stronger backend first.
+- The default Foundry Local backend runs 3–14B models depending on the profile (`smaller` is 3–4B throughout; `small` and `normal` are larger), all materially smaller than the GPT-4-class debaters and judges used in the MAD literature cited in [design.md](design.md) (see *Default models are smaller than the literature assumes* in *Known issues*). Numbers from this CLI on the defaults are useful for *within-configuration* comparisons but should not be quoted against external MAD-vs-baseline results without re-validating on a stronger backend first.
+- Under `auto` execution-provider resolution, a model alias resolves to a hardware-specific variant against the live catalog at startup, so the same profile name can mean different weights on different machines. Pin the resolved variant (visible in the model host's startup log) before quoting any number as reproducible.
 
 For *why* each of these phases exists in the first place and what failure mode each one is meant to neutralise, see [design.md](design.md).

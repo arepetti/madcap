@@ -22,4 +22,12 @@
     <ProjectReference Include="..\Debate.Core\Debate.Core.csproj" />
   </ItemGroup>
 
+  <!-- The shipped personas, copied as the CLI copies them, so tests can assert on the
+       real prompt text rather than on a fixture that can drift away from it. -->
+  <ItemGroup>
+    <None Include="..\personas\*.txt" Link="personas\%(Filename)%(Extension)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

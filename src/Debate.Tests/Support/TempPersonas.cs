@@ -21,7 +21,7 @@ public sealed class TempPersonas : IDisposable
             "PERSONA:critic\nPRIOR:{prior_rephrased}\nPROFILE:{answerer_profile}");
         Write(preset, PersonaTokens.JudgeRephraser, "PERSONA:judge-rephraser\nEXCHANGES:{prior_exchanges}");
         Write(preset, PersonaTokens.JudgeRestater, "PERSONA:judge-restater");
-        Write(preset, PersonaTokens.JudgeArbiter, "PERSONA:judge-arbiter");
+        Write(preset, PersonaTokens.JudgeArbiter, "PERSONA:judge-arbiter\n{no_think}");
         Write(preset, PersonaTokens.JudgeProfiler, "PERSONA:judge-profiler");
 
         Library = new PersonaLibrary(Directory);

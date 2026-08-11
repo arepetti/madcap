@@ -27,6 +27,20 @@ public sealed class DebateContext
     public IModelProvider Provider { get; }
     public PersonaLibrary Personas { get; }
 
+    /// <summary>
+    /// How many past question/verdict pairs are kept. Both lists are rendered into system
+    /// prompts on every question, so they compete with the debate itself for the context
+    /// window: unbounded, a long session eventually crowds out the current question.
+    /// </summary>
+    public const int MaxPriorExchanges = 5;
+
+    /// <summary>
+    /// How much of each verdict is kept for that history. A full verdict (answer,
+    /// justification and unresolved notes) runs to hundreds of tokens; the rephraser only
+    /// needs enough to recognise the topic of a follow-up question.
+    /// </summary>
+    public const int MaxStoredVerdictLength = 400;
+
     public List<string> PriorRephrased { get; } = new();
 
     /// <summary>
@@ -44,6 +58,29 @@ public sealed class DebateContext
     public JudgeRestater JudgeRestater { get; }
     public JudgeArbiter JudgeArbiter { get; }
     public JudgeProfiler JudgeProfiler { get; }
+
+    /// <summary>
+    /// Records a completed question and its verdict for the rephraser's session memory,
+    /// keeping only the most recent <see cref="MaxPriorExchanges"/> and storing each
+    /// verdict in abbreviated form. The two lists stay index-aligned.
+    /// </summary>
+    public void RecordExchange(string rephrased, string verdictText)
+    {
+        PriorRephrased.Add(rephrased);
+        PriorVerdicts.Add(Abbreviate(verdictText, MaxStoredVerdictLength));
+
+        while (PriorRephrased.Count > MaxPriorExchanges)
+        {
+            PriorRephrased.RemoveAt(0);
+            PriorVerdicts.RemoveAt(0);
+        }
+    }
+
+    private static string Abbreviate(string text, int maxLength)
+    {
+        text = text.Trim();
+        return text.Length <= maxLength ? text : string.Concat(text.AsSpan(0, maxLength), "...");
+    }
 
     /// <summary>The four single-job Judge contexts, in pipeline order.</summary>
     public IEnumerable<Actor> JudgeContexts()

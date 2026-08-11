@@ -31,9 +31,13 @@ public sealed class FakeModelProvider : IModelProvider
     /// <summary>Optional per-role output cap, surfaced to assert it reaches ChatOptions.</summary>
     public Dictionary<DebateRole, int?> OutputCaps { get; } = new();
 
+    /// <summary>Optional per-role model name, for prompt text that varies by model family.</summary>
+    public Dictionary<DebateRole, string> ModelNames { get; } = new();
+
     public IChatClient GetClient(DebateRole role) => _clients[role];
 
-    public string ModelName(DebateRole role) => $"fake-{role}".ToLowerInvariant();
+    public string ModelName(DebateRole role) =>
+        ModelNames.TryGetValue(role, out var name) ? name : $"fake-{role}".ToLowerInvariant();
 
     public int EffectiveContextSize => 8192;
 

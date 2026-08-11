@@ -17,8 +17,8 @@ namespace Debate.Core.Actors;
 /// the Critic's objections alone.</item>
 /// </list>
 ///
-/// All four are rebuilt fresh each round; none carries memory across rounds except
-/// through the session state rendered into their system prompts.
+/// All four are rebuilt fresh each question; none carries memory across questions
+/// except through the session state rendered into their system prompts.
 /// </summary>
 public sealed class JudgeRephraser : Actor
 {

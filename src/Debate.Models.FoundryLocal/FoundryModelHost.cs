@@ -88,7 +88,10 @@ public static class FoundryModelHost
                 .ConfigureAwait(false);
             return (chatClient, target.Id);
         }
-        catch (OperationCanceledException)
+        // A timeout during download or EP registration also arrives as an
+        // OperationCanceledException; only a real shutdown should skip the error line the
+        // parent's readiness wait depends on.
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             return null;
         }
@@ -147,18 +150,14 @@ public static class FoundryModelHost
                 continue;
             }
 
-            HostRequest? request;
-            try
+            var request = ModelHostProtocol.DeserializeRequest(line);
+            if (request is null)
             {
-                request = ModelHostProtocol.DeserializeRequest(line);
-            }
-            catch (Exception e)
-            {
-                log($"ignoring malformed request: {e.Message}");
+                log($"ignoring malformed request line: {Truncate(line)}");
                 continue;
             }
 
-            if (request is null || request.Shutdown)
+            if (request.Shutdown)
             {
                 break;
             }
@@ -196,7 +195,11 @@ public static class FoundryModelHost
             await WriteLineAsync(stdout, new HostResponse { Id = request.Id, Text = text }).ConfigureAwait(false);
             return true;
         }
-        catch (OperationCanceledException)
+        // Only a genuine shutdown request stops the loop. The OpenAI client surfaces its
+        // NetworkTimeout (see BuildChatClientAsync) as a TaskCanceledException, which is an
+        // OperationCanceledException too: reporting that as an error keeps the model loaded
+        // instead of silently exiting and forcing a multi-minute reload.
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             return false;
         }
@@ -239,6 +242,9 @@ public static class FoundryModelHost
         "tool" => ChatRole.Tool,
         _ => ChatRole.User,
     };
+
+    private static string Truncate(string line) =>
+        line.Length <= 200 ? line : string.Concat(line.AsSpan(0, 200), "...");
 }
 
 /// <summary>

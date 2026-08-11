@@ -16,4 +16,4 @@ no code fences, no explanation before or after. Use exactly the fields requested
 in the current message, and put your entire response inside those fields.
 Do NOT think out loud or emit any reasoning, analysis, or <think> tags: your very
 first character must be '{' and your last must be '}'.
-/no_think
+{no_think}

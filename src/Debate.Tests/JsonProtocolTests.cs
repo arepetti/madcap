@@ -20,6 +20,24 @@ public class JsonProtocolTests
     }
 
     [Fact]
+    public void Strips_fence_opened_on_the_same_line_as_the_object()
+    {
+        // Regression: fence stripping used to cut everything up to the first newline,
+        // which threw away the whole object when the model put it on the fence line.
+        const string raw = "```json {\"answer\":\"same line\"}\n```";
+        Assert.True(JsonProtocol.TryParse<AnswererReply>(raw, out var reply));
+        Assert.Equal("same line", reply!.Answer);
+    }
+
+    [Fact]
+    public void Strips_a_single_line_fence()
+    {
+        const string raw = "```{\"answer\":\"one line\"}```";
+        Assert.True(JsonProtocol.TryParse<AnswererReply>(raw, out var reply));
+        Assert.Equal("one line", reply!.Answer);
+    }
+
+    [Fact]
     public void Ignores_prose_around_the_object()
     {
         const string raw = "Sure! Here is my reply: {\"answer\":\"x\"} — hope that helps.";
@@ -114,6 +132,14 @@ public class JsonProtocolTests
     {
         Assert.True(JsonProtocol.TryParse<CriticReply>(raw, out var reply));
         Assert.Equal(expected, reply!.Done);
+    }
+
+    [Fact]
+    public void Flexible_string_salvages_an_action_wrapped_in_an_array()
+    {
+        const string raw = "{\"action\":[\"rephrase\"],\"text\":\"neutral question?\"}";
+        Assert.True(JsonProtocol.TryParse<JudgeRephraseReply>(raw, out var reply));
+        Assert.True(reply!.IsRephrase);
     }
 
     [Fact]

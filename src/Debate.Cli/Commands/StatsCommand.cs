@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using Debate.Core;
-using Debate.Models.FoundryLocal;
 using Spectre.Console;
 
 namespace Debate.Cli.Commands;
@@ -203,34 +202,42 @@ public sealed class StatsCommand : ReplCommand
             $"{Markup.Escape(self.ProcessName)} (debate CLI / orchestrator)",
             "[green]running[/]");
 
-        if (_provider is ProcessModelProvider pool)
+        AddChildProcessRows(table);
+        AnsiConsole.Write(table);
+    }
+
+    private void AddChildProcessRows(Table table)
+    {
+        if (_provider is not IBackendDiagnostics diagnostics)
         {
-            var children = pool.GetChildProcesses();
-            if (children.Count == 0)
-            {
-                table.AddRow("—", "child", "[grey]no model host processes resident right now[/]", "—");
-            }
-            else
-            {
-                foreach (var child in children)
-                {
-                    var roles = child.Roles.Count > 0
-                        ? string.Join(", ", child.Roles)
-                        : "(unused)";
-                    table.AddRow(
-                        child.Pid >= 0 ? child.Pid.ToString(CultureInfo.InvariantCulture) : "—",
-                        Markup.Escape(roles),
-                        $"model host: {Markup.Escape(child.Alias)}",
-                        child.Running ? "[green]running[/]" : "[red]exited[/]");
-                }
-            }
-        }
-        else
-        {
-            table.AddRow("—", "child", "[grey]remote provider: no local model processes[/]", "—");
+            table.AddRow("—", "child", "[grey]this provider runs no local model processes[/]", "—");
+            return;
         }
 
-        AnsiConsole.Write(table);
+        var children = diagnostics.TryDescribeProcesses();
+        if (children is null)
+        {
+            table.AddRow("—", "child", "[grey]busy loading a model; process list unavailable[/]", "—");
+            return;
+        }
+
+        if (children.Count == 0)
+        {
+            table.AddRow("—", "child", "[grey]no model host processes resident right now[/]", "—");
+            return;
+        }
+
+        foreach (var child in children)
+        {
+            var roles = child.Roles.Count > 0
+                ? string.Join(", ", child.Roles)
+                : "(unused)";
+            table.AddRow(
+                child.Pid >= 0 ? child.Pid.ToString(CultureInfo.InvariantCulture) : "—",
+                Markup.Escape(roles),
+                $"model host: {Markup.Escape(child.Label)}",
+                child.Running ? "[green]running[/]" : "[red]exited[/]");
+        }
     }
 
     private static void WriteTokenRow(string label, long value) =>

@@ -11,6 +11,7 @@ This is the C# / .NET implementation. The original Python version is preserved u
 ├── README.md
 ├── design.md              # design rationale, references, known issues
 ├── architecture.md        # this file: code map and extension points
+├── testing.md             # benchmark prompts and how to compare configurations
 ├── old-python-src/        # the original Python (Ollama) implementation
 └── src/
     ├── Debate.slnx
@@ -18,17 +19,20 @@ This is the C# / .NET implementation. The original Python version is preserved u
     ├── Debate.Core/                       # the algorithm + abstractions (no UI, no backend)
     ├── Debate.Models.FoundryLocal/        # local backend (Foundry Local)
     ├── Debate.Models.OpenAICompatible/    # remote backend (OpenAI-compatible)
-    └── Debate.Cli/                        # console host (Spectre.Console) + appsettings.json
+    ├── Debate.Cli/                        # console host (Spectre.Console) + appsettings.json
+    └── Debate.Tests/                      # xUnit tests over Debate.Core
 ```
 
 ## High-level shape
 
-`Debate.Core` is a **UI- and backend-agnostic library**. It holds the entire debate algorithm and depends only on `Microsoft.Extensions.AI`'s `IChatClient` abstraction. It never references Foundry, OpenAI, the console, or Spectre. The same library could drive a GUI or web frontend with no changes.
+`Debate.Core` is a **UI- and backend-agnostic library**. It holds the entire debate algorithm and reaches models only through `Microsoft.Extensions.AI`'s `IChatClient` abstraction. Its only other package dependency is `Microsoft.ML.Tokenizers` (plus the cl100k_base data), used by the token counter. It never references Foundry, OpenAI, the console, or Spectre. The same library could drive a GUI or web frontend with no changes.
 
 Two seams keep it decoupled:
 
 - **Models** flow in through `IModelProvider`, which hands the algorithm an `IChatClient` per `DebateRole`. Whether that client is a local Foundry model or a cloud endpoint is invisible to the algorithm.
 - **User interaction** flows out through `IDebateObserver` (output events) and `IClarificationSource` (async input for the rephrase loop). The host implements these.
+
+A backend may additionally implement the optional capabilities in `[IBackendCapabilities.cs](src/Debate.Core/IBackendCapabilities.cs)` — `IPrefetchable` (a warm-up step for `--prefetch`) and `IBackendDiagnostics` (the process list shown by `!stats`). The host tests for these interfaces rather than for a concrete backend type, so a new backend opts in without the CLI knowing it exists.
 
 ```mermaid
 flowchart TD
@@ -41,7 +45,7 @@ flowchart TD
     Cli --> Remote
     Foundry --> Core
     Remote --> Core
-    Foundry -->|in-process| FL[(Foundry Local runtime)]
+    Foundry -->|"child process per model (stdio JSON)"| FL[(Foundry Local runtime)]
     Remote -->|HTTPS| API[(OpenAI-compatible API)]
 ```
 
@@ -56,7 +60,7 @@ The host (`Debate.Cli`) picks a provider from configuration, builds a .NET Gener
 | `[src/Debate.Core/DebateEngine.cs](src/Debate.Core/DebateEngine.cs)` | Public façade: `RunQuestionAsync`, `ClearSessionAsync`, `GetStatsSnapshot`, `GetPersonaInfo`, `GetActorContexts`. |
 | `[src/Debate.Core/DebatePipeline.cs](src/Debate.Core/DebatePipeline.cs)` | The per-question state machine (rephrase, debate, verdict, profile note). Every actor exchange is a JSON contract (see `DebatePrompts`/`JsonProtocol`); a reply that fails to parse triggers one automatic re-ask. |
 | `[src/Debate.Core/DebatePrompts.cs](src/Debate.Core/DebatePrompts.cs)` | The per-phase user prompts; each states the exact JSON shape expected back. Public so `!context` can display them. |
-| `[src/Debate.Core/JsonProtocol.cs](src/Debate.Core/JsonProtocol.cs)` | Reply DTOs and a tolerant `TryParse<T>` (strips code fences, isolates the `{...}` span) so the pipeline never depends on exact-string formatting. |
+| `[src/Debate.Core/JsonProtocol.cs](src/Debate.Core/JsonProtocol.cs)` | Reply DTOs and a tolerant `TryParse<T>` (strips reasoning tags, isolates the outermost `{...}` span, salvages non-string values) so the pipeline never depends on exact-string formatting. |
 | `[src/Debate.Core/DebateContext.cs](src/Debate.Core/DebateContext.cs)` | Shared session state (history, profile, actors) and the `RecordProfileNote` merge logic. |
 | `[src/Debate.Core/Actors/](src/Debate.Core/Actors)` | `Actor` base + `Answerer`/`Critic` and the four Judge contexts (`JudgeRephraser`/`JudgeRestater`/`JudgeArbiter`/`JudgeProfiler`, all routed to the Judge model). Hold their own `ChatMessage` history; temperature applied per call via `ChatOptions`. |
 | `[src/Debate.Core/Profile.cs](src/Debate.Core/Profile.cs)` | Similarity scoring, stylistic-note filter, thresholds. |
@@ -111,8 +115,8 @@ sequenceDiagram
 
 Key invariants enforced by the pipeline (`[DebatePipeline.cs](src/Debate.Core/DebatePipeline.cs)`):
 
-- The Judge is split into four single-job contexts (rephraser, restater, arbiter, profiler), each with its own conversation buffer routed to the Judge model. Per round, all four — and the Critic — are invalidated and rebuilt so their system prompts reflect the latest session state. The Answerer keeps its memory.
-- The **rephraser** never sees the debate; its system prompt carries the prior rephrased questions paired with their verdicts (`{prior_exchanges}`), so follow-up questions stay consistent.
+- The Judge is split into four single-job contexts (rephraser, restater, arbiter, profiler), each with its own conversation buffer routed to the Judge model. **Per question** (`ResetPerQuestion`, not per debate round), all four — and the Critic — are invalidated and rebuilt so their system prompts reflect the latest session state. The Answerer keeps its memory.
+- The **rephraser** never sees the debate; its system prompt carries the prior rephrased questions paired with their verdicts (`{prior_exchanges}`), so follow-up questions stay consistent. That history is capped at the most recent `DebateContext.MaxPriorExchanges` questions, with each stored verdict abbreviated, so a long session cannot crowd the current question out of the context window.
 - The **restater** is the only context that ever ingests the raw Answerer text. The Critic only ever receives its restatement.
 - The Answerer hears critiques verbatim.
 - The **arbiter** rules on the debate in rephrased form only: restatements paired with the Critic's objections, round by round. The Answerer's rebuttal to an objection reaches it as the next round's restatement, never as raw text.
@@ -127,7 +131,11 @@ Commands live in `[src/Debate.Cli/Commands/](src/Debate.Cli/Commands)`. A comman
 
 ### Change the models
 
-Edit the `Models` map under the active provider in `[appsettings.json](src/Debate.Cli/appsettings.json)`. No code changes. Keep `Judge != Answerer` and `Critic != Answerer` model families (see [design.md](design.md) for why). The local provider validates and downloads aliases at startup.
+No code changes are needed; edit `[appsettings.json](src/Debate.Cli/appsettings.json)`. The two backends are shaped differently: the local provider defines named **profiles** (`Debate:FoundryLocal:Profiles:<name>`), each a complete role lineup plus its device and residency settings, selected by `Debate:FoundryLocal:Profile` or `--profile`; the remote provider has a single `Debate:Remote:Models` map.
+
+Keep `Judge != Answerer` and `Critic != Answerer` model families (see [design.md](design.md) for why). Note that a same-vendor remote lineup only partially satisfies this: distinct OpenAI models are still more familiar to each other than to a Mistral or Qwen model.
+
+Aliases are resolved (and downloaded) when a model host actually starts, which for the default `SemiSequential` mode means only the Judge is resolved at startup — a mistyped Answerer or Critic alias surfaces when the debate first reaches that role, not before. Run `--prefetch` to force every model in the active profile to load once.
 
 ### Use a remote / cloud model
 
@@ -135,22 +143,32 @@ Set `Debate:Provider` to `Remote` (or pass `--provider Remote`), set `Debate:Rem
 
 ### Add a new backend
 
-Implement `IModelProvider` in a new project that references `Debate.Core`, add a `services.Add...Provider(...)` extension, and wire it into the provider switch in `[RunCommand.cs](src/Debate.Cli/RunCommand.cs)`. If the backend needs async startup (like Foundry's model download), also implement `IHostedService`. The actors, pipeline, engine, and REPL need no edits.
+Implement `IModelProvider` in a new project that references `Debate.Core`, add a `services.Add...Provider(...)` extension, and wire it into the provider switch in `[RunCommand.cs](src/Debate.Cli/RunCommand.cs)`. If the backend needs async startup (like Foundry's model download), also implement `IHostedService`. Implement `IPrefetchable` and/or `IBackendDiagnostics` to join `--prefetch` and the `!stats` process table; both are optional and the host degrades gracefully without them. The actors, pipeline, engine, and REPL need no edits.
 
 ### Change how questions are processed (the debate pipeline)
 
-All round-level orchestration is in `[DebatePipeline.cs](src/Debate.Core/DebatePipeline.cs)`. The safe knobs are the constants at the top (`MaxDebateRounds`, `MaxRephraseNudges`) and the per-phase prompt templates in `[DebatePrompts.cs](src/Debate.Core/DebatePrompts.cs)`. If you change a prompt's JSON shape, update its reply DTO in `[JsonProtocol.cs](src/Debate.Core/JsonProtocol.cs)` to match.
+All round-level orchestration is in `[DebatePipeline.cs](src/Debate.Core/DebatePipeline.cs)`. The safe knobs are the round cap (`SessionConfig.MaxRounds`, set from `Debate:Defaults:MaxRounds`, the wizard, or `--rounds`), the retry budgets at the top of the class (`MaxRephraseNudges`, `MaxAnswererClarifications`), and the per-phase prompt templates in `[DebatePrompts.cs](src/Debate.Core/DebatePrompts.cs)`. If you change a prompt's JSON shape, update its reply DTO in `[JsonProtocol.cs](src/Debate.Core/JsonProtocol.cs)` to match.
+
+To add, remove, or reorder a phase, subclass `DebatePipeline` and override the phase you want to change: the phase methods are `protected virtual`, and `DebateEngine` accepts a factory so a host can supply the subclass.
 
 ### Add or edit a persona
 
-Personas live in `[src/personas/](src/personas)` as `<name>.<token>.txt` and are copied to the CLI output directory at build. The Answerer and Critic use one file each (`answerer`, `critic`), but the Judge is split into four single-job contexts, each with its own file and its own conversation buffer: `judge-rephraser`, `judge-restater`, `judge-arbiter`, `judge-profiler` (the canonical token list is `PersonaTokens`). Placeholders substituted at render time: `{prior_exchanges}` (rephraser — prior rephrased questions paired with their verdicts), `{prior_rephrased}` (Critic) and `{answerer_profile}` (Critic only). Personas describe the role only and must instruct JSON-only replies; the concrete task and JSON shape for each phase come from `DebatePrompts`, not the persona. Use `!context` to inspect exactly what each actor receives.
+Personas live in `[src/personas/](src/personas)` as `<name>.<token>.txt` and are copied to the CLI output directory at build. The Answerer and Critic use one file each (`answerer`, `critic`), but the Judge is split into four single-job contexts, each with its own file and its own conversation buffer: `judge-rephraser`, `judge-restater`, `judge-arbiter`, `judge-profiler` (the canonical token list is `PersonaTokens`). Placeholders substituted at render time: `{prior_exchanges}` (rephraser — prior rephrased questions paired with their verdicts), `{prior_rephrased}` (Critic), `{answerer_profile}` (Critic only), and `{no_think}` (any persona), which becomes the Qwen3 `/no_think` switch when that role's model is a Qwen and is removed otherwise. Never hardcode `/no_think` into a persona file: on other families it is an unexplained command token, which invites exactly the non-JSON preamble it exists to suppress. Personas describe the role only and must instruct JSON-only replies; the concrete task and JSON shape for each phase come from `DebatePrompts`, not the persona. Use `!context` to inspect exactly what each actor receives.
 
 ### Output formatting
 
 All console output goes through `[SpectreDebateObserver.cs](src/Debate.Cli/SpectreDebateObserver.cs)` and input through `[ConsoleClarificationSource.cs](src/Debate.Cli/ConsoleClarificationSource.cs)`. Redirecting to a file, a GUI, or a web frontend is a matter of implementing `IDebateObserver` / `IClarificationSource` elsewhere.
 
+## Tests
+
+`[src/Debate.Tests/](src/Debate.Tests)` is an xUnit suite over `Debate.Core`. Run it with `dotnet test Debate.slnx` from `src/`.
+
+Most of it drives the real `DebateEngine` with scripted `IChatClient`s (`Support/Scenario.cs`) over temporary persona files, then asserts on each actor's actual conversation buffer — so the context-isolation invariants listed above are executable checks, not just prose. Scripted replies are routed by prompt content (`Support/Phase.cs`) rather than call order, which is what keeps the four Judge contexts apart when they share one client.
+
+The backend projects are not covered: everything under `Debate.Models.*` is verified by reading and by manual runs.
+
 ## What is *not* here
 
 - No persistence. Sessions live in process memory.
 - No structured logging or telemetry beyond the standard .NET logging.
-- No tests. As noted in the README, this is a toy project.
+- No evaluation of answer quality. `!stats` measures cost and context usage, not whether the verdict was right; see [testing.md](testing.md).

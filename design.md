@@ -184,7 +184,7 @@ The profile is the only thing the system carries across rounds, and it is the pa
 
 The loop "critic probes under a rubric, judge arbitrates and updates the rubric" is also a runtime cousin of Constitutional AI [17], except the rubric is grown from observed behaviour rather than written upfront. The stylistic filter is the seatbelt: without it the profile would quickly degenerate into "this model writes long bulleted answers", which is true but useless to a critic.
 
-A caveat that keeps this an interesting *hypothesis* rather than a demonstrated result: the framing is the novel part, but the current implementation does not yet test it, and it is very fragile. Both corroborating observations of a tendency are produced by the same judge under the same biases, so the observed-twice surfacing threshold is not two independent samples (see *The cross-round profile is a mutation vector* under *Known issues*). Turning this from a nice framing into a real implementation needs work (see[TODO.md](TODO.md)).
+A caveat that keeps this an interesting *hypothesis* rather than a demonstrated result: the framing is the novel part, but the current implementation does not yet test it, and it is very fragile. Both corroborating observations of a tendency are produced by the same judge under the same biases, so the observed-twice surfacing threshold is not two independent samples (see *The cross-round profile is a mutation vector* under *Known issues*). Turning this from a nice framing into a real implementation needs work; see *Things to try next* below for what that would involve.
 
 ## Trade-offs
 
